@@ -1,0 +1,405 @@
+import {
+  GRADING_PROMPT_VERSION,
+  SUBMISSION_STATUS,
+  AI_CONFIDENCE,
+  ASSIGNMENT_QUESTION_TYPES,
+} from '../../config/constants.js';
+import { NotFoundError } from '../../shared/errors/index.js';
+import { llmGradingOutputSchema } from './grading.schema.js';
+import { toPublicAiEvaluation } from './ai-evaluation.model.js';
+import { logger } from '../../config/logger.js';
+import { toPublicSubmission } from '../submissions/submission.model.js';
+
+const FALLBACK_MODEL_VERSION = 'rules-v1-fallback';
+
+function buildSources(question, contexts) {
+  return {
+    question: true,
+    model_answer: Boolean(question.modelAnswer),
+    rubric: Boolean(question.rubricText),
+    retrievedChunks: contexts.length,
+    chunkIds: contexts.map((context) => context.chunkId),
+  };
+}
+
+const OBJECTIVE_TYPES = [
+  ASSIGNMENT_QUESTION_TYPES.MULTIPLE_CHOICE,
+  ASSIGNMENT_QUESTION_TYPES.MULTIPLE_SELECT,
+  ASSIGNMENT_QUESTION_TYPES.TRUE_FALSE,
+];
+
+const normalizeOption = (value) => String(value ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+function insufficientFeedback(reason) {
+  if (reason === 'NO_SOURCE_AVAILABLE') {
+    return (
+      'Grading was deferred to mandatory manual review: no trusted source (model answer, rubric, or course material) was available to evaluate this answer.'
+    );
+  }
+  return (
+    'AI grading could not complete for this answer (the provider was unavailable or returned an invalid output). The submission stays queued for manual review and no score was assigned.'
+  );
+}
+
+function insufficientEvaluation(sources, reason) {
+  return {
+    score: null,
+    correctness: null,
+    confidence: AI_CONFIDENCE.INSUFFICIENT_EVIDENCE,
+    feedbackText: insufficientFeedback(reason),
+    misconceptions: [],
+    rubricBreakdown: null,
+    sourcesUsed: { ...sources, reason },
+    modelVersion: FALLBACK_MODEL_VERSION,
+    promptVersion: GRADING_PROMPT_VERSION,
+  };
+}
+
+export function createGradingService({
+  coursesService,
+  aiEvaluationRepository,
+  assignmentRepository,
+  assignmentQuestionRepository,
+  submissionRepository,
+  submissionAttemptRepository,
+  submissionAnswerRepository,
+  courseRepository,
+  retrievalService,
+  llmProvider,
+  assessmentEngine = null,
+}) {
+  async function collectSources(courseId, question) {
+    if (question.modelAnswer && question.rubricText) {
+      return { sources: buildSources(question, []), contexts: [] };
+    }
+    const { contexts } = await retrievalService.retrieveContext({
+      courseId,
+      query: question.questionText,
+    });
+    return { sources: buildSources(question, contexts), contexts };
+  }
+
+  const GRADING_SYSTEM_PROMPT =
+    'You are an academic grading assistant. The model answer and the rubric are the authoritative ' +
+    'grading key; retrieved course excerpts are only supplementary context. Grading rules: ' +
+    '(1) If the student answer is semantically equivalent to the model answer, or covers every rubric ' +
+    'point, award the full maxScore with correctness CORRECT - never deduct for wording, order or style. ' +
+    '(2) Deduct only for rubric points that are missing or factually wrong, proportionally to their ' +
+    'weight, and list each point in rubricBreakdown. ' +
+    '(3) The score measures answer quality only. Confidence measures your certainty about the ' +
+    'evaluation and must never reduce or inflate the score. ' +
+    '(4) Judge only what the question asks. ' +
+    '(5) Confidence calibration: HIGH when the answer unambiguously matches or contradicts the ' +
+    'grading key; MEDIUM when the answer is partially clear or mixes correct and wrong points; ' +
+    'LOW when the answer is ambiguous or hard to map to the rubric. Confidence never changes the score. ' +
+    'Respond with JSON only using this shape: ' +
+    '{"score": number between 0 and maxScore, "correctness": "CORRECT"|"PARTIAL"|"INCORRECT", ' +
+    '"confidence": "HIGH"|"MEDIUM"|"LOW", "feedbackText": string, ' +
+    '"misconceptions": [{"code": string, "description": string}], "rubricBreakdown": object or null}.';
+
+  function objectiveEvaluation(question, selectedOptionIds, answerText) {
+    const options = question.options ?? [];
+    const correct = new Set(question.correctOptionIds ?? []);
+    let selected = new Set(selectedOptionIds ?? []);
+    if (selected.size === 0 && answerText) {
+      selected = new Set(
+        options
+          .filter((option) => normalizeOption(option.text) === normalizeOption(answerText))
+          .map((option) => option.id),
+      );
+    }
+    if (correct.size === 0) return null;
+    const wrongPicks = [...selected].filter((id) => !correct.has(id)).length;
+    const hits = [...selected].filter((id) => correct.has(id)).length;
+    const isMulti = question.type === ASSIGNMENT_QUESTION_TYPES.MULTIPLE_SELECT;
+    const gained = isMulti
+      ? Math.max(0, Math.min(correct.size, hits - wrongPicks))
+      : hits === correct.size && wrongPicks === 0
+        ? correct.size
+        : 0;
+    const score = Math.round((question.maxScore * gained) / correct.size * 100) / 100;
+    const correctness =
+      gained === correct.size && wrongPicks === 0
+        ? 'CORRECT'
+        : gained > 0
+          ? 'PARTIAL'
+          : 'INCORRECT';
+    return {
+      score,
+      correctness,
+      confidence: AI_CONFIDENCE.HIGH,
+      feedbackText:
+        correctness === 'CORRECT'
+          ? 'Objective question matched the answer key exactly - full score awarded deterministically.'
+          : `Objective question graded against the answer key: ${gained} of ${correct.size} correct selection(s).`,
+      misconceptions: [],
+      rubricBreakdown: null,
+      sourcesUsed: { question: true, deterministic: true, model_answer: Boolean(question.modelAnswer), rubric: Boolean(question.rubricText), retrievedChunks: 0, chunkIds: [] },
+      modelVersion: 'rules-v1-objective',
+      promptVersion: GRADING_PROMPT_VERSION,
+    };
+  }
+
+  async function runModel({ question, contexts, answerText, topicTitle }) {
+    const payload = {
+      questionText: question.questionText,
+      maxScore: question.maxScore,
+      modelAnswer: question.modelAnswer ?? null,
+      rubricText: question.rubricText ?? null,
+      hasModelAnswer: Boolean(question.modelAnswer),
+      hasRubric: Boolean(question.rubricText),
+      topicTitle,
+      excerpts: contexts.map((context) => ({ id: context.chunkId, text: context.snippet })),
+      answerText,
+    };
+    let lastError = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (attempt > 0) {
+        // Rate-limited providers need a beat between attempts.
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+      }
+      try {
+        const raw = await llmProvider.completeJson({
+          task: 'grade_assignment_answer',
+          system: GRADING_SYSTEM_PROMPT,
+          user: JSON.stringify(payload),
+          payload,
+        });
+        return llmGradingOutputSchema.parse(raw);
+      } catch (error) {
+        lastError = error;
+        logger.warn(`LLM grading attempt ${attempt + 1} failed: ${error?.message ?? 'unknown error'}`);
+      }
+    }
+    throw lastError ?? new Error('grading model output failed twice');
+  }
+
+  async function gradeAnswerCore({ courseId, topicTitle, question, answerText, selectedOptionIds = null }) {
+    // Repository documents expose `questionType`; preview payloads may carry
+    // `type`. Normalize once so the deterministic objective path always fires.
+    const normalizedQuestion = { ...question, type: question.type ?? question.questionType };
+    if (OBJECTIVE_TYPES.includes(normalizedQuestion.type)) {
+      const deterministic = objectiveEvaluation(normalizedQuestion, selectedOptionIds, answerText);
+      if (deterministic) return deterministic;
+    }
+    const { sources, contexts } = await collectSources(courseId, normalizedQuestion);
+    if (!sources.model_answer && !sources.rubric && contexts.length === 0) {
+      return insufficientEvaluation(sources, 'NO_SOURCE_AVAILABLE');
+    }
+
+    let output;
+    try {
+      output = await runModel({ question: normalizedQuestion, contexts, answerText, topicTitle });
+    } catch {
+      return insufficientEvaluation(sources, 'INVALID_MODEL_OUTPUT');
+    }
+
+    const score = Math.round(Math.min(Math.max(output.score, 0), question.maxScore) * 100) / 100;
+    return {
+      score,
+      correctness: output.correctness,
+      confidence: output.confidence,
+      feedbackText: output.feedbackText,
+      misconceptions: output.misconceptions,
+      rubricBreakdown: output.rubricBreakdown ?? null,
+      sourcesUsed: sources,
+      modelVersion: llmProvider.model,
+      promptVersion: GRADING_PROMPT_VERSION,
+    };
+  }
+
+  function toPublicShape(evaluation) {
+    return {
+      score: evaluation.score,
+      correctness: evaluation.correctness,
+      confidence: evaluation.confidence,
+      feedbackText: evaluation.feedbackText,
+      misconceptions: evaluation.misconceptions,
+      rubricBreakdown: evaluation.rubricBreakdown,
+      sourcesUsed: evaluation.sourcesUsed,
+      modelVersion: evaluation.modelVersion,
+      promptVersion: evaluation.promptVersion,
+    };
+  }
+
+  async function previewForInstructor(user, assignmentId, questionId, payload) {
+    const assignment = await assignmentRepository.findById(assignmentId);
+    if (!assignment) {
+      throw new NotFoundError('Assignment not found');
+    }
+    await coursesService.ensureInstructorCourseAccess(user, assignment.courseId.toString());
+    const question = await assignmentQuestionRepository.findById(questionId);
+    if (!question || String(question.assignmentId) !== String(assignment._id)) {
+      throw new NotFoundError('Question not found');
+    }
+    const course = await courseRepository.findById(assignment.courseId);
+    const topicTitle =
+      (course?.topics ?? []).find((t) => String(t._id) === String(question.topicId))?.title ?? '';
+    const questionType = question.type ?? question.questionType;
+    if (assessmentEngine?.isEnabled() && !OBJECTIVE_TYPES.includes(questionType) && course) {
+      try {
+        const engineEvaluation = await assessmentEngine.previewQuestion({
+          course,
+          question,
+          answerText: payload.trialAnswer,
+        });
+        if (engineEvaluation) return toPublicShape(engineEvaluation);
+      } catch (error) {
+        logger.warn(`assessment engine preview failed, falling back to local grading: ${error?.message}`);
+      }
+    }
+    const evaluation = await gradeAnswerCore({
+      courseId: assignment.courseId,
+      topicTitle,
+      question,
+      answerText: payload.trialAnswer,
+      selectedOptionIds: payload.selectedOptionIds ?? null,
+    });
+    return toPublicShape(evaluation);
+  }
+
+  async function gradeAttemptAnswers(submissionId) {
+    const submission = await submissionRepository.findById(submissionId);
+    if (!submission) return;
+    await submissionRepository.updateById(submissionId, { status: SUBMISSION_STATUS.GRADING });
+
+    const attempt = await submissionAttemptRepository.findLatest(submissionId);
+    if (!attempt) {
+      await submissionRepository.updateById(submissionId, { status: SUBMISSION_STATUS.GRADED });
+      return;
+    }
+
+    const assignment = await assignmentRepository.findById(submission.assignmentId);
+    const answers = await submissionAnswerRepository.listByAttempt(attempt._id);
+    const questions = await assignmentQuestionRepository.listByAssignment(submission.assignmentId);
+    const course = await courseRepository.findById(assignment.courseId);
+
+    let engineEvaluations = null;
+    if (assessmentEngine?.isEnabled() && course && questions.length > 0 && answers.length > 0) {
+      try {
+        engineEvaluations = await assessmentEngine.gradeAttempt({
+          course,
+          assignment,
+          questions,
+          answers,
+          studentId: submission.studentId,
+        });
+      } catch (error) {
+        logger.warn(`assessment engine grading failed, falling back to local AI path: ${error?.message}`);
+      }
+    }
+
+    for (const answer of answers) {
+      const existing = await aiEvaluationRepository.findByAnswerId(answer._id);
+      if (existing) continue;
+      const question = questions.find((q) => String(q._id) === String(answer.questionId));
+      if (!question) continue;
+      const topicTitle =
+        (course?.topics ?? []).find((t) => String(t._id) === String(question.topicId))?.title ?? '';
+      let evaluation = engineEvaluations?.get(String(question._id)) ?? null;
+      if (evaluation) {
+        await aiEvaluationRepository.create({
+          answerId: answer._id,
+          attemptId: attempt._id,
+          submissionId,
+          assignmentId: submission.assignmentId,
+          questionId: question._id,
+          courseId: assignment.courseId,
+          studentId: submission.studentId,
+          topicId: question.topicId,
+          ...evaluation,
+        });
+        continue;
+      }
+      try {
+        evaluation = await gradeAnswerCore({
+          courseId: assignment.courseId,
+          topicTitle,
+          question,
+          answerText: answer.answerText ?? '',
+          selectedOptionIds: answer.selectedOptionIds ?? null,
+        });
+      } catch {
+        evaluation = insufficientEvaluation(
+          { question: true, model_answer: false, rubric: false, retrievedChunks: 0, chunkIds: [] },
+          'GRADING_ERROR',
+        );
+      }
+      await aiEvaluationRepository.create({
+        answerId: answer._id,
+        attemptId: attempt._id,
+        submissionId,
+        assignmentId: submission.assignmentId,
+        questionId: question._id,
+        courseId: assignment.courseId,
+        studentId: submission.studentId,
+        topicId: question.topicId,
+        ...evaluation,
+      });
+    }
+
+    await submissionRepository.updateById(submissionId, { status: SUBMISSION_STATUS.GRADED });
+  }
+
+  async function getSubmissionDetail(user, submissionId) {
+    const submission = await submissionRepository.findById(submissionId);
+    if (!submission) {
+      throw new NotFoundError('Submission not found');
+    }
+    const assignment = await assignmentRepository.findById(submission.assignmentId);
+    if (!assignment) {
+      throw new NotFoundError('Submission not found');
+    }
+    await coursesService.ensureInstructorCourseAccess(user, assignment.courseId.toString());
+
+    const questions = await assignmentQuestionRepository.listByAssignment(assignment._id);
+    const attempts = await submissionAttemptRepository.listBySubmission(submission._id);
+    const latest = attempts[attempts.length - 1] ?? null;
+    const answers = latest ? await submissionAnswerRepository.listByAttempt(latest._id) : [];
+    const evaluations = await aiEvaluationRepository.listBySubmission(submission._id);
+    const evaluationByAnswer = new Map(
+      evaluations.map((evaluation) => [String(evaluation.answerId), toPublicAiEvaluation(evaluation)]),
+    );
+
+    return {
+      submission: toPublicSubmission(submission),
+      assignment: {
+        id: assignment._id.toString(),
+        title: assignment.title,
+        status: assignment.status,
+      },
+      attempts: attempts.map((attempt) => ({
+        id: attempt._id.toString(),
+        attemptNo: attempt.attemptNo,
+        submittedAt: attempt.submittedAt ?? null,
+      })),
+      answers: answers.map((answer) => {
+        const question = questions.find((q) => String(q._id) === String(answer.questionId));
+        return {
+          id: answer._id.toString(),
+          questionId: answer.questionId.toString(),
+          answerText: answer.answerText ?? null,
+          imageUrl: answer.imageUrl ?? null,
+          savedAt: answer.savedAt ?? null,
+          question: question
+            ? {
+                id: question._id.toString(),
+                orderIndex: question.orderIndex,
+                questionText: question.questionText,
+                topicId: question.topicId.toString(),
+                maxScore: question.maxScore,
+                questionType: question.questionType ?? 'essay',
+                options: (question.options ?? []).map((option) => ({ id: option.id, text: option.text })),
+                modelAnswer: question.modelAnswer ?? null,
+                rubricText: question.rubricText ?? null,
+              }
+            : null,
+          selectedOptionIds: answer.selectedOptionIds ?? null,
+          evaluation: evaluationByAnswer.get(String(answer._id)) ?? null,
+        };
+      }),
+    };
+  }
+
+  return { gradeAnswerCore, gradeAttemptAnswers, previewForInstructor, getSubmissionDetail };
+}

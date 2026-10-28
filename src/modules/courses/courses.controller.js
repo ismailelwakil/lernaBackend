@@ -1,0 +1,198 @@
+import { asyncHandler } from '../../shared/utils/async-handler.js';
+import { sendSuccess, sendCreated, buildPaginationMeta } from '../../shared/http/api-response.js';
+import User from '../auth/user.model.js';
+import Course from './course.model.js';
+import Institution from '../academic-structure/institution.model.js';
+import { sendCourseAssignmentEmail } from '../admin/admin-emails.js';
+
+/** Tells an instructor they were assigned to a course (best effort, after the response). */
+async function notifyCourseAssignment(courseId, userId) {
+  const [user, course] = await Promise.all([User.findById(userId).lean(), Course.findById(courseId).select('code title institutionId').lean()]);
+  if (!user?.email || !course) return;
+  const institution = course.institutionId ? await Institution.findById(course.institutionId).select('name').lean() : null;
+  await sendCourseAssignmentEmail({ user, course, institution });
+}
+
+export function createCoursesController({ coursesService }) {
+  const create = asyncHandler(async (req, res) => {
+    const course = await coursesService.createCourse(req.user, req.validated.body);
+    sendCreated(res, course);
+  });
+
+  const creationPolicy = asyncHandler(async (req, res) => {
+    const data = await coursesService.getCreationPolicy(req.user);
+    sendSuccess(res, { data });
+  });
+
+  const list = asyncHandler(async (req, res) => {
+    const { q, page, limit } = req.validated.query;
+    const { items, total } = await coursesService.listCourses(req.user, { q, page, limit });
+    sendSuccess(res, { data: items, meta: buildPaginationMeta({ page, limit, total }) });
+  });
+
+  const getOne = asyncHandler(async (req, res) => {
+    sendSuccess(res, { data: req.course });
+  });
+
+  const update = asyncHandler(async (req, res) => {
+    const course = await coursesService.updateCourse(
+      req.user,
+      req.validated.params.courseId,
+      req.validated.body,
+    );
+    sendSuccess(res, { data: course });
+  });
+
+  const addTopic = asyncHandler(async (req, res) => {
+    const topic = await coursesService.addTopic(
+      req.user,
+      req.validated.params.courseId,
+      req.validated.body,
+    );
+    sendCreated(res, topic);
+  });
+
+  const updateTopic = asyncHandler(async (req, res) => {
+    const topic = await coursesService.updateTopic(
+      req.user,
+      req.validated.params.courseId,
+      req.validated.params.topicId,
+      req.validated.body,
+    );
+    sendSuccess(res, { data: topic });
+  });
+
+  const deleteTopic = asyncHandler(async (req, res) => {
+    const result = await coursesService.deleteTopic(
+      req.user,
+      req.validated.params.courseId,
+      req.validated.params.topicId,
+    );
+    sendSuccess(res, { data: result });
+  });
+
+  const addStaff = asyncHandler(async (req, res) => {
+    const member = await coursesService.addStaff(
+      req.user,
+      req.validated.params.courseId,
+      req.validated.body,
+    );
+    sendCreated(res, member);
+    if (req.validated.body?.userId && req.validated.body.userId !== req.user.id) {
+      notifyCourseAssignment(req.validated.params.courseId, req.validated.body.userId).catch(() => undefined);
+    }
+  });
+
+  const removeStaff = asyncHandler(async (req, res) => {
+    const result = await coursesService.removeStaff(
+      req.user,
+      req.validated.params.courseId,
+      req.validated.params.userId,
+    );
+    sendSuccess(res, { data: result });
+  });
+
+  const enroll = asyncHandler(async (req, res) => {
+    const result = await coursesService.enroll(
+      req.user,
+      req.validated.params.courseId,
+      req.validated.body.studentId,
+    );
+    sendCreated(res, result);
+  });
+
+  const dropEnrollment = asyncHandler(async (req, res) => {
+    const result = await coursesService.dropEnrollment(
+      req.user,
+      req.validated.params.courseId,
+      req.validated.params.studentId,
+    );
+    sendSuccess(res, { data: result });
+  });
+
+  const catalog = asyncHandler(async (req, res) => {
+    const { search, page, limit, year } = req.validated.query;
+    const { items, total, studentYear } = await coursesService.listCourseCatalog(req.user, {
+      search,
+      page,
+      limit,
+      year,
+    });
+    sendSuccess(res, { data: items, meta: { ...buildPaginationMeta({ page, limit, total }), studentYear } });
+  });
+
+  const catalogSelfEnroll = asyncHandler(async (req, res) => {
+    const result = await coursesService.catalogSelfEnroll(req.user, req.validated.params.courseId);
+    sendCreated(res, result);
+  });
+
+  const requestEnrollment = asyncHandler(async (req, res) => {
+    const request = await coursesService.requestEnrollment(
+      req.user,
+      req.validated.params.courseId,
+      req.validated.body,
+    );
+    sendCreated(res, request);
+  });
+
+  const myEnrollmentRequests = asyncHandler(async (req, res) => {
+    const { status, page, limit } = req.validated.query;
+    const { items, total } = await coursesService.listMyEnrollmentRequests(req.user, {
+      status,
+      page,
+      limit,
+    });
+    sendSuccess(res, { data: items, meta: buildPaginationMeta({ page, limit, total }) });
+  });
+
+  const listEnrollmentRequests = asyncHandler(async (req, res) => {
+    const { status, page, limit } = req.validated.query;
+    const { items, total } = await coursesService.listEnrollmentRequests(req.user, {
+      status,
+      page,
+      limit,
+    });
+    sendSuccess(res, { data: items, meta: buildPaginationMeta({ page, limit, total }) });
+  });
+
+  const decideEnrollmentRequest = asyncHandler(async (req, res) => {
+    const result = await coursesService.decideEnrollmentRequest(
+      req.user,
+      req.validated.params.requestId,
+      req.validated.body,
+    );
+    sendSuccess(res, { data: result });
+  });
+
+  const listEnrollments = asyncHandler(async (req, res) => {
+    const { page, limit } = req.validated.query;
+    const { items, total } = await coursesService.listEnrollments(
+      req.user,
+      req.validated.params.courseId,
+      { page, limit },
+    );
+    sendSuccess(res, { data: items, meta: buildPaginationMeta({ page, limit, total }) });
+  });
+
+  return {
+    create,
+    creationPolicy,
+    list,
+    getOne,
+    update,
+    addTopic,
+    updateTopic,
+    deleteTopic,
+    addStaff,
+    removeStaff,
+    enroll,
+    dropEnrollment,
+    listEnrollments,
+    catalog,
+    requestEnrollment,
+    myEnrollmentRequests,
+    listEnrollmentRequests,
+    decideEnrollmentRequest,
+    catalogSelfEnroll,
+  };
+}

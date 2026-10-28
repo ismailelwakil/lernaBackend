@@ -1,0 +1,109 @@
+import { Router } from 'express';
+import healthRoutes from './health.routes.js';
+import { authRouter } from '../../../modules/auth/index.js';
+import { academicStructureRouter } from '../../../modules/academic-structure/index.js';
+import { coursesRouter } from '../../../modules/courses/index.js';
+import { knowledgeIngestionRouter } from '../../../modules/knowledge/index.js';
+import { learnerDiagnosticRouter, publicDemoMasteryRouter } from '../../../modules/learner/index.js';
+import { tutorRouter } from '../../../modules/tutor/index.js';
+import { practiceRouter } from '../../../modules/practice/index.js';
+import { reassessmentRouter } from '../../../modules/reassessment/index.js';
+import { assignmentsRouter } from '../../../modules/assignments/index.js';
+import { submissionsRouter } from '../../../modules/submissions/index.js';
+import { gradingRouter } from '../../../modules/grading/index.js';
+import { reviewRouter } from '../../../modules/review/index.js';
+import { remedialRouter } from '../../../modules/remedial/index.js';
+import { auditRouter } from '../../../modules/audit/index.js';
+import { analyticsRouter } from '../../../modules/analytics/index.js';
+import { adminRouter, linkConsentRouter, invitationAcceptRouter } from '../../../modules/admin/index.js';
+import { learningResourcesRouter } from '../../../modules/content-generation/index.js';
+import { lernaRouter } from '../../../modules/lerna/index.js';
+import { topicsRouter } from '../../../modules/topics/index.js';
+import { sanadRouter, sanadPublicRouter } from '../../../modules/sanad/index.js';
+import { voiceRouter, voiceFacadeRouter } from '../../../modules/voice/index.js';
+
+const router = Router();
+
+// Public, read-only demo data for the login page (no auth). Mounted first: some routers
+// below call authenticate at root level and would otherwise block it.
+router.use(publicDemoMasteryRouter);
+// Public invitation links sent by email (/?invite=TOKEN in the web app).
+router.use('/invitations', invitationAcceptRouter);
+// Public "Stop reminders" link from Plany emails.
+router.use('/sanad', sanadPublicRouter);
+// Server-to-server grounding for the LernaVoice service (own key, no student token).
+router.use(voiceFacadeRouter);
+
+router.use(healthRoutes);
+router.use('/auth', authRouter);
+// Handles /institutions/* and /units/* routes internally.
+router.use(academicStructureRouter);
+router.use('/courses', coursesRouter);
+// Handles /courses/:courseId/materials/* routes internally (knowledge module).
+router.use(knowledgeIngestionRouter);
+// AI topic detection maintenance: /courses/:courseId/topics/detect|merge.
+router.use(topicsRouter);
+// Handles /courses/:courseId/learner-profile and /diagnostics/* routes
+// internally (learner module).
+router.use(learnerDiagnosticRouter);
+// Handles /courses/:courseId/tutor/* routes internally (AI tutor module).
+router.use(tutorRouter);
+router.use(voiceRouter);
+// Handles /courses/:courseId/practice/* routes internally (practice module).
+router.use(practiceRouter);
+// Handles /courses/:courseId/reassessments/* and /learning-gain routes
+// internally (reassessment module).
+router.use(reassessmentRouter);
+
+// User-scoped LeRna (Academic OS) bridge: /students/me/learning,
+// /students/me/learning/review, /students/me/ai-preferences, /ai-health.
+router.use(lernaRouter);
+
+// Handles /courses/:courseId/learning-resources and /learning-resources/:id/file
+// (content-generation module - EDUNation "Study Tools" parity: grounded text
+// resources + real SVG/PPTX artifacts; media kinds honestly unavailable).
+router.use(learningResourcesRouter);
+
+// Handles /courses/:courseId/assignments/* and /assignments/* routes
+// internally (assignments module).
+router.use(assignmentsRouter);
+
+// Handles /assignments/:assignmentId/answers/* and /submit routes internally
+// (submissions module - the student side of assignments).
+router.use(submissionsRouter);
+
+// Handles preview-evaluation and /submissions/:id review reads
+// (grading module - the shared AI grading pipeline).
+router.use(gradingRouter);
+
+// Handles /assignments/:id/review, common-mistakes, bulk-approve and the
+// four /submissions/:id decision actions (review module - instructor
+// approval workflow with the audit trail).
+router.use(reviewRouter);
+
+// Handles /courses/:courseId/remedial/* routes internally (remedial module -
+// instructor-authored remedial content with a draft-then-publish workflow).
+router.use(remedialRouter);
+
+// Handles GET /courses/:courseId/audit-log (audit module - the governance
+// read model over the recorded actions; students always 403).
+router.use(auditRouter);
+
+// Handles GET /courses/:courseId/analytics, /coverage-gaps and
+// /instructor/home (analytics module - precomputed snapshots refreshed by
+// debounced domain-event recompute).
+router.use(analyticsRouter);
+
+// Plany study agent (students)
+router.use('/sanad', sanadRouter);
+
+// Institution admin area: /admin/* (delegated permission scopes; super admin
+// bypasses keys, officers act strictly inside theirs).
+router.use('/admin', adminRouter);
+router.use('/link-invitations', linkConsentRouter);
+
+
+// Feature module routers (diagnostics, tutor, ...) are mounted here
+// by their module composition roots as each module is implemented.
+
+export default router;
